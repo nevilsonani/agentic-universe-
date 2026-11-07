@@ -309,7 +309,7 @@ class Planner:
         for d in list(canary):
             last = ds[d].get("last") or {}
             r = last.get("ratio") if last.get("expected_conn", 0) >= self.s.did_min_expected_conn else None
-            if cur0.get(d, 0) > self.s.did_canary_share + 0.02 and (r is None or r >= self.s.did_graduate_ratio):
+            if cur0.get(d, 0) > self.s.did_canary_share + 0.02 and (r is None or r >= self.s.did_keep_ratio):
                 canary.remove(d)
                 healthy.append(d)
         if not healthy and not canary:
@@ -422,34 +422,65 @@ class Planner:
             shares = {a: max([norm(dist(base_cfg, k, d)).get(a, 0) for k in base_ids | {"default"}] or [0])
                       for a in f.arms}
             r_draws = None
+            held = st.setdefault("share_since", {}).setdefault(d, {})
             for ai, a in enumerate(f.arms):
                 if ai == f.ref:
                     continue
-                # compare *shrunk* estimates: a lucky first day must not later read as "decay" (winner's curse)
-                be, ve = early[d].post_mean[ai], early[d].post_var[ai]
-                br, vr = recent[d].post_mean[ai], recent[d].post_var[ai]
-                if not (np.isfinite(early[d].var[ai]) and np.isfinite(recent[d].var[ai])):
-                    continue
-                z = (be - br) / math.sqrt(ve + vr)
-                pm, pv = recent[d].post_mean[ai], recent[d].post_var[ai]
-                from .stats import norm_cdf
-                p_good = 1 - norm_cdf((math.log(1 + s.winner_min_lift) - pm) / math.sqrt(max(pv, 1e-12)))
-                info = {"early_rr": round(math.exp(be), 4), "recent_rr": round(math.exp(br), 4), "z": round(z, 2),
-                        "p_recent_still_winning": round(p_good, 3), "share": round(shares[a], 3)}
-                snap["decay"].setdefault(d, {})[a] = info
-                if a in decayed:
-                    if p_good >= 0.9:
-                        decisions.append({"kind": "recovered", "dim": d, "arm": a, **info})
-                        decayed.pop(a)
-                held = st.setdefault("share_since", {}).setdefault(d, {})
                 if shares[a] >= s.decay_min_share:
                     held.setdefault(a, now)
                 else:
                     held.pop(a, None)
-                if a not in decayed and shares[a] >= s.decay_min_share and now - held.get(a, now) >= \
-                        s.decay_min_hold_h * 60 and z >= s.decay_drop_z and p_good <= s.decay_p_still_good:
-                    decayed[a] = {"minute": now, **info}
-                    decisions.append({"kind": "decay", "cohort": "*", "dim": d, "arm": a, **info})
+                if a in decayed:
+                    rr_ = recent[d]
+                    if np.isfinite(rr_.var[ai]) and rr_.beta[ai] - 1.28 * math.sqrt(rr_.var[ai]) >                             math.log(1 + s.winner_min_lift):
+                        decisions.append({"kind": "recovered", "dim": d, "arm": a,
+                                          "recent_rr": round(math.exp(rr_.beta[ai]), 4)})
+                        decayed.pop(a)
+                    continue
+                if a not in held:
+                    continue
+                # Decay = a decline relative to the arm's own record *since it became the majority arm*:
+                # [became majority, split) vs [split, now]. Both windows are post-promotion, so the lucky
+                # streak that got it promoted (winner's curse) is excluded. Unshrunk estimates: shrinking the
+                # recent one toward 0 would drag every real winner toward "no longer winning".
+                since_day = held[a] // 1440 + (1 if held[a] % 1440 > 12 * 60 else 0)
+                if split - since_day < 1:
+                    continue
+                post = model.fit(now_day, since_day=since_day, until_day=split, segments=False)[d]
+                be, ve, br, vr = post.beta[ai], post.var[ai], recent[d].beta[ai], recent[d].var[ai]
+                if not (np.isfinite(ve) and np.isfinite(vr)):
+                    continue
+                z = (be - br) / math.sqrt(ve + vr)
+                # "stopped winning": worse than control on the post-promotion regime, or on recent data alone
+                regime = model.fit(now_day, since_day=since_day, segments=False)[d]
+                hi_reg = math.exp(regime.beta[ai] + 1.2816 * math.sqrt(regime.var[ai])) \
+                    if np.isfinite(regime.var[ai]) else float("inf")
+                hi_rec = math.exp(br + 1.2816 * math.sqrt(vr))
+                ref_n = float(recent[d].n[f.ref])
+                info = {"post_promotion_rr": round(math.exp(be), 4), "recent_rr": round(math.exp(br), 4),
+                        "z": round(z, 2), "regime_rr_hi90": round(hi_reg, 4), "recent_rr_hi90": round(hi_rec, 4),
+                        "recent_control_n": ref_n, "share": round(shares[a], 3), "since": since_day}
+                snap["decay"].setdefault(d, {})[a] = info
+                why = None
+                if z >= s.decay_drop_z and be - br >= math.log(1 + s.decay_min_drop) and br < 0:
+                    # a drop alone (still above control) only stops the ramp; demotion needs it below control
+                    why = f"recent effect fell {z:.1f} SE below its post-promotion effect and under control"
+                elif hi_reg < 1.0:
+                    why = "worse than control since it became the majority arm (90% upper bound < 1)"
+                elif hi_rec < 1.0 and ref_n >= s.decay_min_control_n:
+                    why = "worse than control over the last day (90% upper bound < 1)"
+                if why:
+                    decayed[a] = {"minute": now, "why": why, **info}
+                    decisions.append({"kind": "decay", "cohort": "*", "dim": d, "arm": a, "why": why, **info})
+            # ramp concurrence: an arm may only *gain* share while recent evidence agrees with the cumulative
+            # estimate — otherwise TS keeps feeding an arm whose novelty is fading (the cumulative mean lags)
+            no_ramp = set()
+            for ai, a in enumerate(f.arms):
+                if ai == f.ref or not np.isfinite(recent[d].var[ai]) or not np.isfinite(f.var[ai]):
+                    continue
+                if recent[d].beta[ai] < f.beta[ai] - math.sqrt(recent[d].var[ai]):
+                    no_ramp.add(a)
+            st.setdefault("no_ramp", {})[d] = sorted(no_ramp)
             if decayed:
                 # decayed arms are judged on recent evidence only
                 r_draws = self._tup_draws(recent[d], tups, S, rng)
@@ -472,6 +503,7 @@ class Planner:
                 summ_r = summ
                 cstate = st.setdefault("arms", {}).setdefault(c.id, {}).setdefault(d, {"winner": None})
                 cstate["decayed_arms"] = sorted(st["decay"].get(d, {}))
+                cstate["no_ramp"] = st.get("no_ramp", {}).get(d, [])
                 tgt, why = self._allocate(f, summ, summ_r, cur, cstate, c.id, d, now, decisions)
                 snap["cohorts"][c.id][d] = {"current": cur, "target": tgt, "why": why,
                                             "arms": {a: {k: round(v, 4) for k, v in x.items()} for a, x in summ.items()},
@@ -642,6 +674,8 @@ class Planner:
                         break
             if a in decayed:
                 caps[a] = min(caps.get(a, 1.0), s.floor_share)
+            if a in set(cstate.get("no_ramp") or []):
+                caps[a] = min(caps.get(a, 1.0), max(cur.get(a, 0.0), s.floor_share))
         tgt = _waterfill(pb, floors, caps)
         # ---- winner declaration (deterministic rule, audited)
         best = max(arms, key=lambda a: use[a]["p_best"])

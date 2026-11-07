@@ -47,10 +47,11 @@ class Settings:
     het_alloc_p: float = 0.01         # segment deviations used for allocation only if Cochran's Q p < this
     recent_half_life_days: float = 1.0   # time-discounted estimate used for decay detection
     decay_window_days: int = 1        # 'recent' = today + yesterday (24–48h); 'earlier' = everything before
-    decay_drop_z: float = 1.0         # an arm holding ≥ decay_min_share is demoted when recent effect is this many
-    decay_min_share: float = 0.4      #   SEs below its earlier effect AND P(recent RR > 1+min_lift) ≤ decay_p_still_good
-    decay_p_still_good: float = 0.2
-    decay_min_hold_h: int = 24        # an arm must have carried its share this long before 'decay' can be claimed
+    decay_drop_z: float = 2.6         # an arm holding ≥ decay_min_share is demoted when its recent effect is this many
+    decay_min_share: float = 0.4      #   SEs below its own post-promotion effect (one-sided p≈0.005)...
+    decay_min_drop: float = 0.05     # ...and the drop is at least 5% (practical significance)
+    decay_min_control_n: float = 150  # control calls in the recent window before "worse than control lately" counts
+    decay_min_hold_h: int = 24        # (post-promotion window must cover ≥1 full day before 'decay' can be claimed)
     ramp: tuple = ((0.06, 0.35), (0.045, 0.6), (0.0, 0.85))  # (posterior sd >= x -> max share y): evidence-gated ramp
     loser_max_sd: float = 0.05        # 'loser' needs a tight posterior, not one bad afternoon
     min_realloc_tv: float = 0.10      # don't spend an approval on a reallocation smaller than this
@@ -67,8 +68,10 @@ class Settings:
 
     # ---------------------------------------------------------------- caller-ID health
     did_quarantine_ratio: float = 0.75  # DID pickup below 75% of its peers (upper CI) → quarantine
-    did_graduate_ratio: float = 0.85    # canary graduates when its lower CI clears this
-    did_canary_share: float = 0.08   # a pre-flagged canary (≈0.55 health) then costs <1.5% DID health
+    did_graduate_ratio: float = 0.95    # canary graduates when its lower CI clears this. A healthy *fresh*
+                                        # number looks ~1.2x next to loaded peers, so ~1.0 is a warning sign
+    did_keep_ratio: float = 0.85       # a canary already carrying a full share keeps it unless it looks this bad
+    did_canary_share: float = 0.06   # a pre-flagged canary (0.45–0.55 health) then costs <2% DID health
     did_short_window_h: int = 3
     did_long_window_h: int = 24
     did_min_expected_conn: float = 30.0   # long window: enough evidence to call a canary / quarantine
