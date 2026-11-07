@@ -305,8 +305,10 @@ def did_health(pdid: CellTable, n_did: int, now_minute: int, window_h: int, excl
         se = math.sqrt(var) if np.isfinite(var) else float("inf")
         peer_rate = b.sum() / max(n0.sum(), 1)
         out[i] = {"ratio": math.exp(lr), "lo": math.exp(lr - z * se) if np.isfinite(se) else 0.0,
-                  "load": float(load[i]), "peer_load": float(np.median([load[j] for j in range(n_did)
-                                                                        if j != i and peers_mask[j]] or [0.0])),
+                  # compare with the most-loaded other active number: a lightly loaded canary among the peers
+                  # must not make a genuinely flagged number look "overloaded" (and shield it)
+                  "load": float(load[i]), "peer_load": float(max([load[j] for j in range(n_did)
+                                                                  if j != i and peers_mask[j]] or [0.0])),
                   "hi": math.exp(lr + z * se) if np.isfinite(se) else float("inf"),
                   "dials": tot_d, "conn": float(a.sum()), "rate": float(a.sum() / tot_d),
                   "expected_conn": float(tot_d * peer_rate), "peer_rate": float(peer_rate)}

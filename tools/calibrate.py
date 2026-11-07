@@ -9,7 +9,8 @@
    the allocation put on non-control arms anyway (harmless here, but it is the cost of looking).
 2. Power: same, with one arm truly +10% — how often, and how fast, it is declared.
 3. False decay alarms: an arm that truly stays +8% holds 75% share; how often does the decay
-   rule (post-promotion vs recent, z ≥ 2.6, ≥5% drop, recent below control) fire in 8 days.
+   rule (post-promotion vs recent, z ≥ 2.6, ≥5% drop, recent below control; or worse than control),
+   confirmed on a second check ≥ 4h later, fire in 8 days.
 4. Hallucination CUSUM: in-control average run length and detection delay at 2.5× and 3.6×.
 """
 from __future__ import annotations
@@ -36,6 +37,7 @@ def world(rng, rr, days=8, conn_per_day=900, base=0.55, check_every_h=4, decay_t
     cells = []                                    # (stratum, arm, n, y, day)
     declared, first_day, nonctrl_traffic, decays = False, None, [], 0
     held_since = 0 if start_share is not None else None
+    suspect = False
     for day in range(days):
         for block in range(24 // check_every_h):
             n = int(conn_per_day * check_every_h / 12) if 9 <= block * check_every_h < 21 else 0
@@ -73,10 +75,12 @@ def world(rng, rr, days=8, conn_per_day=900, base=0.55, check_every_h=4, decay_t
                 a = 1
                 z = (fp["beta"][a] - fr["beta"][a]) / math.sqrt(fp["cov"][a, a] + fr["cov"][a, a])
                 hi_rec = math.exp(fr["beta"][a] + 1.2816 * math.sqrt(fr["cov"][a, a]))
-                if (z >= S.decay_drop_z and fp["beta"][a] - fr["beta"][a] >= math.log(1 + S.decay_min_drop)
-                        and fr["beta"][a] < 0) or (hi_rec < 1 and fr["n_by_arm"][0] >= S.decay_min_control_n):
+                hit = (z >= S.decay_drop_z and fp["beta"][a] - fr["beta"][a] >= math.log(1 + S.decay_min_drop)
+                       and fr["beta"][a] < 0) or (hi_rec < 1 and fr["n_by_arm"][0] >= S.decay_min_control_n)
+                if hit and suspect:                 # suspect → confirm: two qualifying checks >= 4h apart
                     decays += 1
                     break
+                suspect = hit
             if block in (2, 4) and not decay_test:        # two governance windows a day (10:00, 16:00)
                 w = np.maximum(pbest, 1e-6) ** S.ts_gamma
                 w = w / w.sum()

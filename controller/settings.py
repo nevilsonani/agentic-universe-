@@ -49,6 +49,8 @@ class Settings:
     decay_drop_z: float = 2.6         # an arm holding ≥ decay_min_share is demoted when its recent effect is this many
     decay_min_share: float = 0.4      #   SEs below its own post-promotion effect (one-sided p≈0.005)...
     decay_min_drop: float = 0.05     # ...and the drop is at least 5% (practical significance)
+    decay_confirm_min: int = 240      # suspect → confirm: criteria must still hold this much later...
+    decay_confirm_calls: int = 200    # ...with at least this many more connected calls
     decay_min_control_n: float = 150  # control calls in the recent window before "worse than control lately" counts
     ramp: tuple = ((0.06, 0.35), (0.045, 0.6), (0.0, 0.85))  # (posterior sd >= x -> max share y): evidence-gated ramp
     loser_max_sd: float = 0.05        # 'loser' needs a tight posterior, not one bad afternoon

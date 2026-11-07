@@ -478,9 +478,21 @@ class Planner:
                     why = "worse than control since it became the majority arm (90% upper bound < 1)"
                 elif hi_rec < 1.0 and ref_n >= s.decay_min_control_n:
                     why = "worse than control over the last day (90% upper bound < 1)"
-                if why:
+                # suspect → confirm: act only if the criteria still hold >= 4h and >= 200 connected calls later.
+                # A one-window fluke on a real winner (calibration: ~8% of 8-day runs) then costs nothing,
+                # where acting on it cost a multi-step harmful rollback; a real decay only gets stronger.
+                sus = st.setdefault("decay_suspect", {}).setdefault(d, {})
+                n_now = float(f.n.sum())
+                if why and a not in sus:
+                    sus[a] = {"minute": now, "n": n_now, "why": why}
+                    decisions.append({"kind": "decay_suspected", "dim": d, "arm": a, "why": why, **info})
+                elif why and now - sus[a]["minute"] >= s.decay_confirm_min and n_now - sus[a]["n"] >= s.decay_confirm_calls:
+                    sus.pop(a)
                     decayed[a] = {"minute": now, "why": why, **info}
                     decisions.append({"kind": "decay", "cohort": "*", "dim": d, "arm": a, "why": why, **info})
+                elif not why and a in sus:
+                    sus.pop(a)
+                    decisions.append({"kind": "decay_cleared", "dim": d, "arm": a, **info})
             # ramp concurrence: an arm may only *gain* share while recent evidence agrees with the cumulative
             # estimate — otherwise TS keeps feeding an arm whose novelty is fading (the cumulative mean lags)
             no_ramp = set()
