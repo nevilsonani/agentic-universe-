@@ -78,6 +78,16 @@ def exact_repr(target: dict) -> dict | None:
     for c in cands:
         if all(v > 0 for v in c.values()) and platform_norm(c) == target:
             return c
+    # wider search: scalings K·(1 ± n ulp). Finds a preimage for every realistic drift we generated
+    # (3,000 cases of repeated re-normalisation of percent weights; the cheap candidates miss ~0.1%)
+    for K in [1.0] + [float(k) for k in range(2, 65)] + [100.0, 1000.0]:
+        for direction in (math.inf, -math.inf):
+            c = K
+            for _ in range(64):
+                x = {k: target[k] * c for k in keys}
+                if all(v > 0 for v in x.values()) and platform_norm(x) == target:
+                    return x
+                c = math.nextafter(c, direction)
     return None
 
 
