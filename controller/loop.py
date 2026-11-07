@@ -320,10 +320,11 @@ class Controller:
             busy = self.gov.has_open_approval(wf, routine_only=True) or any(
                 r["status"] == "notice" for r in self.gov.open_rows(wf, "auto"))
             snap = None
-            if not busy and self._could_act(w, now):
-                deployed = config_cohorts(cfg)
-                tabs = self.ing.t(wf)
-                if not deployed and st.get("design") and "cohorts" not in frozen:
+            can_act = not busy and self._could_act(w, now)
+            deployed = config_cohorts(cfg)
+            tabs = self.ing.t(wf)
+            if not deployed and st.get("design") and "cohorts" not in frozen:
+                if can_act:   # the bootstrap bundle (cohorts + timing + first exploration) goes out together
                     cohorts = [Cohort(c["id"], c["where"]) for c in st["design"]["cohorts"]]
                     pickup = PickupTimeModel(self.s, self.fs, tabs["ptime"], w.window)
                     facets.append(Facet("cohorts", {"cohorts"}, "routine",
@@ -341,19 +342,20 @@ class Controller:
                     vf, snap = self.planner.variant_facet(w, st, now, cfg, cohorts, frozen, bootstrap=True)
                     if vf:
                         facets.append(vf)
-                else:
-                    cohorts = deployed
-                    sched = st.get("schedule") or {}
-                    if "schedule" not in frozen and cohorts and now - sched.get("minute", -10 ** 9) >= \
-                            self.s.schedule_refresh_days * MIN_PER_DAY:
-                        pickup = PickupTimeModel(self.s, self.fs, tabs["ptime"], w.window)
-                        sf = self.planner.schedule_facet(w, now, cohorts, cfg, pickup)
-                        if sf:
-                            facets.append(sf)
-                        st["schedule"] = {"minute": now, "gain": sf.predicted["pickup_rel_gain"] if sf else 0.0}
-                    vf, snap = self.planner.variant_facet(w, st, now, cfg, cohorts, frozen)
-                    if vf:
-                        facets.append(vf)
+            else:
+                cohorts = deployed
+                sched = st.get("schedule") or {}
+                if can_act and "schedule" not in frozen and cohorts and now - sched.get("minute", -10 ** 9) >=                         self.s.schedule_refresh_days * MIN_PER_DAY:
+                    pickup = PickupTimeModel(self.s, self.fs, tabs["ptime"], w.window)
+                    sf = self.planner.schedule_facet(w, now, cohorts, cfg, pickup)
+                    if sf:
+                        facets.append(sf)
+                    st["schedule"] = {"minute": now, "gain": sf.predicted["pickup_rel_gain"] if sf else 0.0}
+                # analysis (incl. decay detection) runs every hour whether or not we can act right now; only
+                # routing waits for a window. Detection that only ran when we could act missed decays.
+                vf, snap = self.planner.variant_facet(w, st, now, cfg, cohorts, frozen)
+                if vf and (can_act or vf.urgency != "routine"):
+                    facets.append(vf)
             if snap:
                 st["snapshot"] = snap
                 st["snapshot_minute"] = now
