@@ -1,0 +1,17 @@
+# Voluntary rules per tenant, stricter than the policy the simulator enforces.
+# They come from conversations with the client (stakeholders/0x_*.md) and are
+# applied on top of each workflow's `governance` block — never looser than it.
+tenants:
+  northwind_life:
+    # Meera Iyer (Compliance): "No customer-facing change without a named human
+    # approval on our side." Their policy already forbids auto-apply of
+    # welcome/voice; this makes it explicit even if a policy is loosened later.
+    customer_facing_auto_apply: false
+    note: "Compliance requires named approval for anything a customer hears; ops changes reported in the weekly summary."
+  kestrel_finance:
+    # Anita Desai (Ops supervisor): two requests a day, never before 11:00,
+    # tell me before anything changes on a running campaign.
+    max_routine_requests_per_day: 2
+    not_before_hour: 11
+    auto_apply_notice_minutes: 60
+    note: "Max 2 routine requests/day, none before 11:00; customer-facing auto-applies announced 60 min ahead."
