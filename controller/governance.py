@@ -52,6 +52,26 @@ def clean_json(o):
     return o
 
 
+def canon_config(cfg: dict) -> dict:
+    """Allocation weights as integers (percent, or 1/10000) whenever they sit on that grid.
+
+    The platform re-normalises what we send and compares distributions with exact float
+    equality. Re-normalising an already-normalised dict whose float sum is 1.0000000000000002
+    flips the last bit, which makes an untouched dimension look "changed" (and auto-apply then
+    refuses it). Integers on a fixed grid round-trip exactly: 78/100 is the same double every time.
+    """
+    import copy
+    out = copy.deepcopy(cfg)
+    for cid, dims in (out.get("allocations") or {}).items():
+        for d, w in list(dims.items()):
+            for unit in (100, 10000):
+                ints = {k: round(v * unit) for k, v in w.items()}
+                if all(abs(v * unit - ints[k]) < 1e-6 for k, v in w.items()) and sum(ints.values()) == unit:
+                    dims[d] = {k: int(v) for k, v in ints.items() if v > 0}
+                    break
+    return out
+
+
 @dataclass
 class Draft:
     wf: str
@@ -165,7 +185,7 @@ class Governance:
                 return False, f"backing off after a rejection until {label(back)}"
         return True, "ok"
 
-    def auto_ok(self, wf: str, now: int, urgency: str) -> tuple[bool, str]:
+    def auto_ok(self, wf: str, now: int, urgency: str, customer_facing: bool = False) -> tuple[bool, str]:
         open_appr = self.open_rows(wf, "approval")
         if urgency == "routine" and open_appr:
             return False, "an approval is in flight; a routine auto-apply would make it stale"
@@ -173,6 +193,9 @@ class Governance:
             return False, "a recent approval is in flight; a mild protective change waits (≤4h) rather than stale it"
         last = self.store.meta(f"last_auto:{wf}")
         cool = self.s.safety_step_cooldown_min if urgency != "routine" else self.s.auto_apply_cooldown_min
+        if urgency == "routine" and customer_facing:
+            last = self.store.meta(f"last_auto_cf:{wf}")
+            cool = self.s.variant_auto_cooldown_min
         if last is not None and now - last < cool:
             return False, f"auto-apply cooldown ({cool} min)"
         if any(r["status"] in ("notice", "sending") for r in self.open_rows(wf, "auto")):
@@ -214,6 +237,7 @@ class Governance:
         return clean_json(self._raw_body(pid, d))
 
     def _raw_body(self, pid: str, d: Draft) -> dict:
+        d.proposed_config = canon_config(d.proposed_config)
         if d.channel == "auto":
             return {"proposal_id": pid, "base_version": d.base_version, "proposed_config": d.proposed_config,
                     "rationale": f"{d.change_summary}. {d.rationale}", "evidence": d.evidence}
@@ -277,8 +301,11 @@ class Governance:
         self._set(pid, now, "applied", "applied", {"version": version, "dims": dims, "why": f"live as v{version}"},
                   applied_version=version, applied_minute=now)
         if self.get(pid)["channel"] == "auto":
+            r = self.get(pid)
             with self.store.tx():
-                self.store.set_meta(f"last_auto:{self.get(pid)['wf']}", now)
+                self.store.set_meta(f"last_auto:{r['wf']}", now)
+                if any(set(x.get("dims", [])) & {"welcome_message", "voice"} for x in r["intents"]):
+                    self.store.set_meta(f"last_auto_cf:{r['wf']}", now)
         row = self.get(pid)
         for cb in self.on_applied:
             cb(row["wf"], version, row)

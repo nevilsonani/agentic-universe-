@@ -357,7 +357,7 @@ class Controller:
             return True
         ad = w.auto_dims()
         return bool(ad & {"welcome_message", "voice"}) and self.gov.pref(w.id).customer_facing_auto_apply and \
-            self.gov.auto_ok(w.id, now, "routine")[0] and (now % MIN_PER_DAY) // 60 in range(*w.gov["approver_hours"])
+            self.gov.auto_ok(w.id, now, "routine", customer_facing=True)[0] and (now % MIN_PER_DAY) // 60 in range(*w.gov["approver_hours"])
 
     # ================================================================== routing
     def _route(self, w, now: int, facets: list[Facet], st: dict):
@@ -385,7 +385,8 @@ class Controller:
             if not group:
                 continue
             urg = max((f.urgency for f in group), key=URG.get)
-            ok, why = self.gov.auto_ok(wf, now, urg)
+            cf = any(f.name == "variants" for f in group)
+            ok, why = self.gov.auto_ok(wf, now, urg, customer_facing=cf)
             if not ok:
                 continue
             cfg = self.reg.config(wf)

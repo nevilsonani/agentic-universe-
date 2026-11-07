@@ -101,8 +101,13 @@ def limit_shift(base: dict, new: dict, max_shift: float) -> dict:
             if t <= cap or t == 0:
                 continue
             lam = cap / t
-            mix = {o: (1 - lam) * a.get(o, 0) + lam * b.get(o, 0) for o in set(a) | set(b)}
-            mix = {o: round(v, 6) for o, v in mix.items() if v > 1e-6}
+            while lam > 0:
+                mix = round_dist({o: (1 - lam) * a.get(o, 0) + lam * b.get(o, 0) for o in set(a) | set(b)}, 0.01)
+                if tv(a, mix) <= cap + 1e-9:
+                    break
+                lam -= 0.01
+            if lam <= 0:
+                mix = a
             out["allocations"].setdefault(k, {})[d] = mix
     return out
 
@@ -311,7 +316,7 @@ class Planner:
             for d in healthy:
                 target[d] = (1 - c_share * len(canary)) / len(healthy)
             mode = "canary" if canary else "even"
-        target = {k: round(v, 4) for k, v in target.items() if v > 0}
+        target = round_dist({k: v for k, v in target.items() if v > 0}, 0.01)
         cur = norm(dist(cur_cfg, "default", "caller_id"))
         cohort_bad = any(bad and set(bad) & set((d.get("caller_id") or {})) for k, d in cur_cfg["allocations"].items()
                          if k != "default")
@@ -348,9 +353,11 @@ class Planner:
             if not r:
                 continue
             ds[d]["last"] = {k: round(v, 4) for k, v in r.items()}
-            enough = r["expected_conn"] >= self.s.did_min_expected_conn
+            need = self.s.did_short_min_expected_conn if short else self.s.did_min_expected_conn
+            bar = self.s.did_short_ratio if short else self.s.did_quarantine_ratio
+            enough = r["expected_conn"] >= need
             state = ds[d]["state"]
-            if enough and r["hi"] < self.s.did_quarantine_ratio and state != "quarantined":
+            if enough and r["hi"] < bar and state != "quarantined":
                 ds[d].update(state="quarantined", since=now, reason=f"pickup {r['ratio']:.2f}× peers "
                              f"(90% CI {r['lo']:.2f}–{r['hi']:.2f}, {r['dials']:.0f} dials, last {win}h)")
                 out.append({"did": d, "from": state, "to": "quarantined", "window_h": win, **r})
@@ -404,9 +411,10 @@ class Planner:
             for ai, a in enumerate(f.arms):
                 if ai == f.ref:
                     continue
-                be, ve = early[d].beta[ai], early[d].var[ai]
-                br, vr = recent[d].beta[ai], recent[d].var[ai]
-                if not (np.isfinite(ve) and np.isfinite(vr)):
+                # compare *shrunk* estimates: a lucky first day must not later read as "decay" (winner's curse)
+                be, ve = early[d].post_mean[ai], early[d].post_var[ai]
+                br, vr = recent[d].post_mean[ai], recent[d].post_var[ai]
+                if not (np.isfinite(early[d].var[ai]) and np.isfinite(recent[d].var[ai])):
                     continue
                 z = (be - br) / math.sqrt(ve + vr)
                 pm, pv = recent[d].post_mean[ai], recent[d].post_var[ai]
@@ -419,7 +427,13 @@ class Planner:
                     if p_good >= 0.9:
                         decisions.append({"kind": "recovered", "dim": d, "arm": a, **info})
                         decayed.pop(a)
-                elif shares[a] >= s.decay_min_share and z >= s.decay_drop_z and p_good <= s.decay_p_still_good:
+                held = st.setdefault("share_since", {}).setdefault(d, {})
+                if shares[a] >= s.decay_min_share:
+                    held.setdefault(a, now)
+                else:
+                    held.pop(a, None)
+                if a not in decayed and shares[a] >= s.decay_min_share and now - held.get(a, now) >= \
+                        s.decay_min_hold_h * 60 and z >= s.decay_drop_z and p_good <= s.decay_p_still_good:
                     decayed[a] = {"minute": now, **info}
                     decisions.append({"kind": "decay", "cohort": "*", "dim": d, "arm": a, **info})
             if decayed:
@@ -553,7 +567,8 @@ class Planner:
             return round_dist(tgt, 0.01), f"explore untested arms at {s0:.0%} each"
         # ---- Thompson target with guard rails
         pb = {a: use[a]["p_best"] for a in arms}
-        losers = {a for a in arms if a != ref and use[a]["p_lt_ref"] >= s.loser_p and use[a]["rr"] <= s.loser_max_rr}
+        losers = {a for a in arms if a != ref and use[a]["p_lt_ref"] >= s.loser_p and use[a]["rr"] <= s.loser_max_rr
+                  and (use[a]["sd_log"] <= s.loser_max_sd or a in decayed)}
         for a in losers:
             if cur.get(a, 0) > 0:
                 decisions.append({"kind": "loser", "cohort": cid, "dim": d, "arm": a, "rr": use[a]["rr"],
@@ -567,6 +582,11 @@ class Planner:
                 floors[a] = max(floors.get(a, 0), s.floor_share)
             if a != ref and use[a]["p_safe"] < s.proven_prob:
                 caps[a] = s.unproven_cap
+            if a != ref:   # evidence-gated ramp: share can only grow as the posterior tightens
+                for sd_min, cap in s.ramp:
+                    if use[a]["sd_log"] >= sd_min:
+                        caps[a] = min(caps.get(a, 1.0), cap)
+                        break
             if a in decayed:
                 caps[a] = min(caps.get(a, 1.0), s.floor_share)
         tgt = _waterfill(pb, floors, caps)
