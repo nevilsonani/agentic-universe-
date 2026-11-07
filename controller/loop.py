@@ -68,7 +68,7 @@ class Controller:
             now = st["sim_minute"]
             self._ingest()
             self._handle_ctl(now)
-            if not self.store.meta("bootstrapped"):
+            if self.store.meta("bootstrapped") is None:
                 self._bootstrap(now)
             if not recovered:
                 self.gov.recover(now)
@@ -254,12 +254,16 @@ class Controller:
             trans = self.planner.did_update(w, st, now, short=True)
             cur = norm(dist(cfg, "default", "caller_id"))
             hits = [t for t in trans if t["to"] == "quarantined" and cur.get(t["did"], 0) > 0]
+            # severity = share of the workflow's pickup being lost right now. Only a real dent (≥3%) is an
+            # incident that may jump the queue (and make an in-flight approval stale); a failing canary is not.
+            severity = sum(cur.get(t["did"], 0) * max(0.0, 1 - t["ratio"]) for t in hits)
             with self.store.tx():
                 for t in trans:
                     self.store.decide(now, wf, "did_state", f"{t['did']}: {t['from']} → {t['to']} "
-                                      f"({st['did'][t['did']]['reason']})", t)
-                if hits and not self.inc.open_incident(wf, "did_flagged"):
-                    iid = self.inc.create(wf, "did_flagged", now, {"dids": [t["did"] for t in hits], "evidence": hits})
+                                      f"({st['did'][t['did']]['reason']})", {**t, "severity": severity})
+                if hits and severity >= 0.03 and not self.inc.open_incident(wf, "did_flagged"):
+                    iid = self.inc.create(wf, "did_flagged", now, {"dids": [t["did"] for t in hits], "evidence": hits,
+                                                                   "severity": severity})
                     st["did_incident_open"] = iid
                     self.store.alert(now, "page" if not w.auto_dims() & {"caller_id"} else "ticket", wf, "did_flagged",
                                      f"{wf}: caller ID {', '.join(t['did'] for t in hits)} pickup collapsed "

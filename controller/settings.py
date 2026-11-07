@@ -76,7 +76,7 @@ class Settings:
     # ---------------------------------------------------------------- governance
     emergency_reserve: int = 1        # approval slots per 24h held back for incidents
     reject_backoff_hours: float = 4.0
-    approval_send_margin_min: int = 30
+    approval_send_margin_min: int = 0    # the platform decides requests that land exactly at expiry
     auto_apply_cooldown_min: int = 60  # between routine auto-applies on one workflow (staged ramp, not a loophole)
     safety_step_cooldown_min: int = 15  # between safety (risk-reducing) auto-apply steps
     plan_every_min: int = 60

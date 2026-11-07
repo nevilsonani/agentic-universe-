@@ -30,6 +30,28 @@ log = logging.getLogger("controller.governance")
 OPEN = ("notice", "sending", "pending", "approved", "applying")
 
 
+def clean_json(o):
+    """Strict-JSON copy: non-finite floats → None, numpy scalars → Python, sets → sorted lists."""
+    import math
+    try:
+        import numpy as np
+        if isinstance(o, np.generic):
+            o = o.item()
+        elif isinstance(o, np.ndarray):
+            o = o.tolist()
+    except ImportError:
+        pass
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {str(k): clean_json(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [clean_json(v) for v in o]
+    if isinstance(o, set):
+        return [clean_json(v) for v in sorted(o, key=str)]
+    return o
+
+
 @dataclass
 class Draft:
     wf: str
@@ -144,8 +166,11 @@ class Governance:
         return True, "ok"
 
     def auto_ok(self, wf: str, now: int, urgency: str) -> tuple[bool, str]:
-        if urgency == "routine" and self.has_open_approval(wf):
+        open_appr = self.open_rows(wf, "approval")
+        if urgency == "routine" and open_appr:
             return False, "an approval is in flight; a routine auto-apply would make it stale"
+        if urgency == "protective" and any(now - (r["sent_minute"] or now) < 240 for r in open_appr):
+            return False, "a recent approval is in flight; a mild protective change waits (≤4h) rather than stale it"
         last = self.store.meta(f"last_auto:{wf}")
         cool = self.s.safety_step_cooldown_min if urgency != "routine" else self.s.auto_apply_cooldown_min
         if last is not None and now - last < cool:
@@ -170,8 +195,8 @@ class Governance:
                 "INSERT INTO proposals(proposal_id, wf, kind, channel, status, base_version, created_minute, "
                 "not_before_minute, summary, body, intents, note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, d.wf, d.kind, d.channel, status, d.base_version, now, now + d.notice_minutes,
-                 d.change_summary, json.dumps(body), json.dumps([f.to_json() if hasattr(f, "to_json") else f
-                                                                 for f in d.facets]),
+                 d.change_summary, json.dumps(body), json.dumps(clean_json([f.to_json() if hasattr(f, "to_json")
+                                                                            else f for f in d.facets])),
                  f"{d.urgency}"))
             self.store.decide(now, d.wf, f"proposal_{status}", d.change_summary,
                               {"proposal_id": pid, "channel": d.channel, "urgency": d.urgency,
@@ -186,6 +211,9 @@ class Governance:
         return self._send(pid, now)
 
     def _body(self, pid: str, d: Draft) -> dict:
+        return clean_json(self._raw_body(pid, d))
+
+    def _raw_body(self, pid: str, d: Draft) -> dict:
         if d.channel == "auto":
             return {"proposal_id": pid, "base_version": d.base_version, "proposed_config": d.proposed_config,
                     "rationale": f"{d.change_summary}. {d.rationale}", "evidence": d.evidence}
