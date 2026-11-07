@@ -262,7 +262,7 @@ class Ingestor:
         log.info("restored aggregates in %.1fs", time.time() - t0)
 
     # ------------------------------------------------------------------ one chunk
-    def ingest(self, n: int, kind: str, data: bytes) -> ChunkResult:
+    def ingest(self, n: int, kind: str, data: bytes, until_minute: int | None = None) -> ChunkResult:
         t0 = time.time()
         loads = json.loads
         calls, leads, camps, ctl = [], [], [], []
@@ -302,7 +302,10 @@ class Ingestor:
             for h in self.hooks:
                 h(res)
             self.store.set_meta("cursor", n)
-            self.store.set_meta("last_event_minute", res.max_minute)
+            if until_minute is not None:
+                self.store.set_meta("cursor_until_minute", until_minute)
+            if res.max_minute > -10 ** 9:
+                self.store.set_meta("last_event_minute", res.max_minute)
         res.seconds = time.time() - t0
         self.stats["events"] += ev
         self.stats["calls"] += len(calls)

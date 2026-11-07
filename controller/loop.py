@@ -135,7 +135,7 @@ class Controller:
             if ch["chunk"] <= self.store.meta("cursor", -1):
                 continue
             data = self.client.chunk_bytes(ch["chunk"])
-            res = self.ing.ingest(ch["chunk"], ch["kind"], data)
+            res = self.ing.ingest(ch["chunk"], ch["kind"], data, until_minute=ch.get("until_minute"))
             log.debug("chunk %d (%s): %d events in %.2fs", res.chunk, res.kind, res.events, res.seconds)
 
     # ================================================================== control events
@@ -537,8 +537,10 @@ class Controller:
     def _observe(self, now: int, st: dict):
         if now % 60 != 0:
             return
-        last_ev = self.store.meta("last_event_minute", now)
-        lag = max(0, now - (last_ev or now))
+        # lag = how far the newest chunk we have applied trails the simulated clock (0 when caught up);
+        # "time since the last call" would page every night, when nobody is being dialled
+        upto = self.store.meta("cursor_until_minute", now)
+        lag = max(0, now - (upto if upto is not None else now))
         ist = self.ing.stats
         with self.store.tx():
             self.store.metric(now, "ingest_lag_sim_min", lag)
@@ -613,7 +615,10 @@ def _rss_mb() -> float:
                             ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
             c = PMC()
             c.cb = ctypes.sizeof(PMC)
-            ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(PMC), wintypes.DWORD]
+            k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb)
             return c.PeakWorkingSetSize / 1e6
         except Exception:
             return -1.0
