@@ -45,13 +45,11 @@ class Settings:
     loser_max_rr: float = 0.98
     het_alpha: float = 0.05           # segment-specific *claims* in the audit: Bonferroni-divided
     het_alloc_p: float = 0.01         # segment deviations used for allocation only if Cochran's Q p < this
-    recent_half_life_days: float = 1.0   # time-discounted estimate used for decay detection
     decay_window_days: int = 1        # 'recent' = today + yesterday (24–48h); 'earlier' = everything before
     decay_drop_z: float = 2.6         # an arm holding ≥ decay_min_share is demoted when its recent effect is this many
     decay_min_share: float = 0.4      #   SEs below its own post-promotion effect (one-sided p≈0.005)...
     decay_min_drop: float = 0.05     # ...and the drop is at least 5% (practical significance)
     decay_min_control_n: float = 150  # control calls in the recent window before "worse than control lately" counts
-    decay_min_hold_h: int = 24        # (post-promotion window must cover ≥1 full day before 'decay' can be claimed)
     ramp: tuple = ((0.06, 0.35), (0.045, 0.6), (0.0, 0.85))  # (posterior sd >= x -> max share y): evidence-gated ramp
     loser_max_sd: float = 0.05        # 'loser' needs a tight posterior, not one bad afternoon
     min_realloc_tv: float = 0.10      # don't spend an approval on a reallocation smaller than this
@@ -62,7 +60,6 @@ class Settings:
     schedule_kappa: float = 2.0       # weight = (relative pickup at this hour) ** kappa
     schedule_floor: float = 0.2       # never 0: an hour left out of a table gets weight 0 → starved leads
     schedule_cap: float = 4.0
-    schedule_min_dials: int = 400     # per cohort, before its hour profile is trusted
     schedule_min_gain: float = 0.01   # predicted pickup gain needed to propose a schedule
     schedule_refresh_days: float = 2.0
 
@@ -96,7 +93,7 @@ class Settings:
     variant_auto_cooldown_min: int = 180  # customer-facing auto-applies: at most every 3h, or we chase noise
     safety_step_cooldown_min: int = 15  # between safety (risk-reducing) auto-apply steps
     plan_every_min: int = 60
-    credit_reserve_frac: float = 0.5   # half the credits are only for incidents
+    max_credits_per_incident: float = 20.0  # one incident (one tenant) can't drain the shared pool
 
     # ---------------------------------------------------------------- loop
     step_minutes: int = 15

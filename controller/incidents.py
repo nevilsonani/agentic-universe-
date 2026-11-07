@@ -165,7 +165,15 @@ class Incidents:
         except (ApiError, TransportError):
             return 0.0
 
-    def _spend_ok(self, cost: float) -> bool:
+    def _spend_ok(self, cost: float, incident_id: str | None = None) -> bool:
+        """Credits are spent only on incidents, and at most `max_credits_per_incident` on any one of them:
+        the pool is shared across tenants, so one tenant's incident must not starve the next one's."""
+        if incident_id is not None:
+            spent = (self.ctx.store.q1("SELECT COALESCE(SUM((n + 99) / 100), 0) FROM validations WHERE purpose=?",
+                                       (incident_id,)) or 0) +                     (self.ctx.store.q1("SELECT COALESCE(SUM(cost), 0) FROM credits WHERE ref=? AND kind='llm_suggest_fixes'",
+                                       (incident_id,)) or 0)
+            if spent + cost > self.ctx.s.max_credits_per_incident:
+                return False
         return self._credits() >= cost
 
     def _drive(self, wf: str, inc: dict, now: int):
@@ -222,7 +230,7 @@ class Incidents:
         cands = [(p, "production evidence: %d connected calls, %.2f%% flagged, %.1f%% engaged" % (n, 100 * r, 100 * e))
                  for p, n, r, e in self._known_good(wf, exclude)]
         if not cands and not d.get("llm"):
-            if self._spend_ok(3):
+            if self._spend_ok(3, inc["id"]):
                 try:
                     r = ctx.client.suggest_fixes(wf, f"hallucination flags at {d['rate_since']:.1%} on prompt "
                                                      f"{d['prompt']} vs {d['baseline_rate']:.1%} baseline")
@@ -244,10 +252,12 @@ class Incidents:
             if best is None or (gov_min <= best["pass_rate"] < bar and best["n"] < s.validation_topup_n):
                 n = s.validation_n if best is None else s.validation_topup_n
                 cost = math.ceil(n / 100)
-                if not self._spend_ok(cost):
-                    self.update(inc["id"], now, "detected", d, f"not enough credits to validate {p}")
+                if not self._spend_ok(cost, inc["id"]):
+                    self.update(inc["id"], now, "detected", d, f"credit budget for this incident exhausted before {p}")
                     with ctx.store.tx():
-                        ctx.store.alert(now, "page", wf, "credits", "credits exhausted during an incident")
+                        ctx.store.alert(now, "page", wf, "credits",
+                                        f"{wf}: incident {inc['id']} hit its credit cap or the pool is empty; "
+                                        f"a human must pick the prompt (see incident detail for validations so far)")
                     return
                 try:
                     v = ctx.client.validate(wf, p, n)

@@ -56,6 +56,7 @@ class Controller:
         self._last_plan = None
         self._t_day = time.time()
         self._wall = {}
+        self._available_until = None
 
     # ================================================================== run
     def run(self) -> dict:
@@ -131,6 +132,8 @@ class Controller:
     def _ingest(self):
         cur = self.store.meta("cursor", -1)
         chunks = self.client.chunks("history", after=cur) + self.client.chunks("events", after=cur)
+        if chunks:
+            self._available_until = max(self._available_until or -10 ** 9, max(c["until_minute"] for c in chunks))
         for ch in sorted(chunks, key=lambda c: c["chunk"]):
             if ch["chunk"] <= self.store.meta("cursor", -1):
                 continue
@@ -537,10 +540,12 @@ class Controller:
     def _observe(self, now: int, st: dict):
         if now % 60 != 0:
             return
-        # lag = how far the newest chunk we have applied trails the simulated clock (0 when caught up);
-        # "time since the last call" would page every night, when nobody is being dialled
-        upto = self.store.meta("cursor_until_minute", now)
-        lag = max(0, now - (upto if upto is not None else now))
+        # lag = newest chunk the platform has published minus newest chunk we have applied (0 when caught up).
+        # Neither "time since the last call" nor "time since the last chunk" works: no chunk is published while
+        # nobody is being dialled, so both would page every night.
+        upto = self.store.meta("cursor_until_minute")
+        avail = self._available_until if self._available_until is not None else upto
+        lag = max(0, (avail or 0) - (upto if upto is not None else (avail or 0)))
         ist = self.ing.stats
         with self.store.tx():
             self.store.metric(now, "ingest_lag_sim_min", lag)
