@@ -58,6 +58,29 @@ def platform_norm(w: dict) -> dict:
     return {o: float(x) / s for o, x in w.items() if x > 0}
 
 
+def exact_repr(target: dict) -> dict | None:
+    """A weight map that platform_norm() turns into `target` bit-for-bit, or None if we can't find one."""
+    import itertools
+    import math
+    keys = list(target)
+    cands = [dict(target)]
+    for unit in (100, 1000, 10000, 100000, 1000000):
+        cands.append({k: round(target[k] * unit) for k in keys})
+    for K in list(range(2, 33)) + [100, 1000, 10 ** 6]:
+        cands.append({k: target[k] * K for k in keys})
+    if len(keys) <= 5:
+        for steps in itertools.product((-1, 0, 1), repeat=len(keys)):
+            x = {}
+            for k, st in zip(keys, steps):
+                v = target[k]
+                x[k] = math.nextafter(v, math.inf) if st > 0 else math.nextafter(v, -math.inf) if st < 0 else v
+            cands.append(x)
+    for c in cands:
+        if all(v > 0 for v in c.values()) and platform_norm(c) == target:
+            return c
+    return None
+
+
 def canon_config(cfg: dict, stored: dict | None = None) -> dict:
     """Choose, per distribution, a representation the platform will normalise to the intended floats.
 
@@ -87,12 +110,7 @@ def canon_config(cfg: dict, stored: dict | None = None) -> dict:
             sd = stored_dist(cid, d)
             if sd is not None and set(platform_norm(w)) == set(sd) and \
                     all(abs(platform_norm(w)[k] - sd[k]) < 1e-9 for k in sd):
-                for c in [dict(sd)] + cands:
-                    if platform_norm(c) == sd:
-                        dims[d] = c
-                        break
-                else:
-                    dims[d] = dict(sd)
+                dims[d] = exact_repr(sd) or dict(sd)
             elif cands:
                 dims[d] = cands[0]
     return out
