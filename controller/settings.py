@@ -42,8 +42,10 @@ class Settings:
     loser_max_rr: float = 0.98
     het_alpha: float = 0.05           # heterogeneity (segment-specific effect) test, Bonferroni-divided
     recent_half_life_days: float = 1.0   # time-discounted estimate used for decay detection
-    decay_p: float = 0.90             # roll back a winner when P(recent RR < 1) >= this ...
-    decay_drop_z: float = 2.0         # ... or its recent effect is this many SEs below its promoted effect
+    decay_window_days: int = 1        # 'recent' = today + yesterday (24–48h); 'earlier' = everything before
+    decay_drop_z: float = 2.0         # an arm holding ≥ decay_min_share is demoted when recent effect is this many
+    decay_min_share: float = 0.4      #   SEs below its earlier effect AND P(recent RR > 1+min_lift) ≤ decay_p_still_good
+    decay_p_still_good: float = 0.2
     min_realloc_tv: float = 0.10      # don't spend an approval on a reallocation smaller than this
     min_expected_gain: float = 0.003  # ... or one whose expected engagement gain is below 0.3%
     mc_draws: int = 4000              # posterior draws (fixed seed → deterministic)
@@ -59,7 +61,7 @@ class Settings:
     # ---------------------------------------------------------------- caller-ID health
     did_quarantine_ratio: float = 0.75  # DID pickup below 75% of its peers (upper CI) → quarantine
     did_graduate_ratio: float = 0.85    # canary graduates when its lower CI clears this
-    did_canary_share: float = 0.125
+    did_canary_share: float = 0.08   # a pre-flagged canary (≈0.55 health) then costs <1.5% DID health
     did_short_window_h: int = 3
     did_long_window_h: int = 24
     did_min_expected_conn: float = 12.0

@@ -372,7 +372,9 @@ class Planner:
         eng = self.ing.t(wf.id)["eng"]
         model = EngagementModel(s, self.fs, eng, wf.options, ref)
         fit = model.fit(now_day, half_life=None)
-        recent = model.fit(now_day, half_life=s.recent_half_life_days, segments=False)
+        split = now_day - s.decay_window_days
+        recent = model.fit(now_day, since_day=split, segments=False)
+        early = model.fit(now_day, until_day=split, segments=False)
         tups, cnt = self.population(wf, now)
         if len(tups) == 0:
             return None, {}
@@ -381,8 +383,10 @@ class Planner:
         conn_w = cnt.copy()  # population weights: recently uploaded leads per feature tuple
         cohorts_all = cohorts + [Cohort("default", {})]
         names = assign({"cohorts": [c.to_config() for c in cohorts]}, self.fs, tups)
-        snap = {"dims": {}, "cohorts": {}}
-        tup_draws, tup_draws_recent = {}, {}
+        snap = {"dims": {}, "cohorts": {}, "decay": {}}
+        decisions = []
+        tup_draws = {}
+        base_ids = {x["id"] for x in base_cfg.get("cohorts") or []}
         for d in VARIANT_DIMS:
             f = fit[d]
             snap["dims"][d] = {"arms": f.arms, "ref": f.arms[f.ref],
@@ -391,10 +395,41 @@ class Planner:
                                "global_sd": [round(math.sqrt(x), 4) for x in f.post_var.tolist()],
                                "heterogeneity": {feat: {a: {"p": round(v["p"], 5), "sig": v["sig"]}
                                                         for a, v in hv.items()} for feat, hv in f.het.items()}}
-            tup_draws[d] = self._tup_draws(f, tups, S, rng)
-            tup_draws_recent[d] = self._tup_draws(recent[d], tups, S, rng)
+            draws = self._tup_draws(f, tups, S, rng)
+            # ---- decay (C7): an arm carrying real traffic whose recent effect fell well below its earlier one
+            decayed = st.setdefault("decay", {}).setdefault(d, {})
+            shares = {a: max([norm(dist(base_cfg, k, d)).get(a, 0) for k in base_ids | {"default"}] or [0])
+                      for a in f.arms}
+            r_draws = None
+            for ai, a in enumerate(f.arms):
+                if ai == f.ref:
+                    continue
+                be, ve = early[d].beta[ai], early[d].var[ai]
+                br, vr = recent[d].beta[ai], recent[d].var[ai]
+                if not (np.isfinite(ve) and np.isfinite(vr)):
+                    continue
+                z = (be - br) / math.sqrt(ve + vr)
+                pm, pv = recent[d].post_mean[ai], recent[d].post_var[ai]
+                from .stats import norm_cdf
+                p_good = 1 - norm_cdf((math.log(1 + s.winner_min_lift) - pm) / math.sqrt(max(pv, 1e-12)))
+                info = {"early_rr": round(math.exp(be), 4), "recent_rr": round(math.exp(br), 4), "z": round(z, 2),
+                        "p_recent_still_winning": round(p_good, 3), "share": round(shares[a], 3)}
+                snap["decay"].setdefault(d, {})[a] = info
+                if a in decayed:
+                    if p_good >= 0.9:
+                        decisions.append({"kind": "recovered", "dim": d, "arm": a, **info})
+                        decayed.pop(a)
+                elif shares[a] >= s.decay_min_share and z >= s.decay_drop_z and p_good <= s.decay_p_still_good:
+                    decayed[a] = {"minute": now, **info}
+                    decisions.append({"kind": "decay", "cohort": "*", "dim": d, "arm": a, **info})
+            if decayed:
+                # decayed arms are judged on recent evidence only
+                r_draws = self._tup_draws(recent[d], tups, S, rng)
+                for a in decayed:
+                    ai = f.arms.index(a)
+                    draws[:, :, ai] = r_draws[:, :, ai]
+            tup_draws[d] = draws
         targets: dict[str, dict[str, dict]] = {}
-        decisions = []
         for c in cohorts_all:
             sel = names == c.id
             if not sel.any():
@@ -403,17 +438,15 @@ class Planner:
             snap["cohorts"][c.id] = {"label": c.label, "share": round(float(conn_w[sel].sum() / conn_w.sum()), 4)}
             for d in VARIANT_DIMS:
                 f = fit[d]
-                cur = norm(dist(base_cfg, c.id if c.id in {x["id"] for x in base_cfg.get("cohorts") or []}
-                                else "default", d))
+                cur = norm(dist(base_cfg, c.id if c.id in base_ids else "default", d))
                 rr = np.einsum("sta,t->sa", tup_draws[d][:, sel, :], w)
-                rr_recent = np.einsum("sta,t->sa", tup_draws_recent[d][:, sel, :], w)
                 summ = summarize_draws(rr, f.arms, f.ref)
-                summ_r = summarize_draws(rr_recent, f.arms, f.ref)
+                summ_r = summ
                 cstate = st.setdefault("arms", {}).setdefault(c.id, {}).setdefault(d, {"winner": None})
+                cstate["decayed_arms"] = sorted(st["decay"].get(d, {}))
                 tgt, why = self._allocate(f, summ, summ_r, cur, cstate, c.id, d, now, decisions)
                 snap["cohorts"][c.id][d] = {"current": cur, "target": tgt, "why": why,
                                             "arms": {a: {k: round(v, 4) for k, v in x.items()} for a, x in summ.items()},
-                                            "recent": {a: round(x["rr"], 4) for a, x in summ_r.items()},
                                             "winner": cstate.get("winner")}
                 if d in frozen:
                     continue
@@ -499,24 +532,15 @@ class Planner:
         arms = f.arms
         ref = arms[f.ref]
         never_run = [a for i, a in enumerate(arms) if f.n[i] == 0]
-        # ---- decay: the current winner's recent (1-day half-life) effect has turned
-        win = cstate.get("winner")
+        decayed = set(cstate.get("decayed_arms") or [])
+        for a in decayed:   # keep saying so until traffic has actually moved off it
+            if cur.get(a, 0) > s.floor_share + 0.01 and not any(
+                    x["kind"] == "decay" and x["dim"] == d and x["arm"] == a for x in decisions):
+                decisions.append({"kind": "decay", "cohort": "*", "dim": d, "arm": a, "still_on": cur.get(a)})
+        if cstate.get("winner") and cstate["winner"]["arm"] in decayed:
+            cstate.setdefault("history", []).append({**cstate["winner"], "ended": now, "why": "decay"})
+            cstate["winner"] = None
         use = summ
-        if win and win.get("arm") in summ_r:
-            a = win["arm"]
-            r = summ_r[a]
-            drop_z = (math.log(max(win["rr"], 1e-6)) - math.log(max(r["rr"], 1e-6))) / max(
-                math.hypot(win.get("sd_log", 0.05), r["sd_log"]), 1e-6)
-            if r["p_lt_ref"] >= s.decay_p or drop_z >= s.decay_drop_z:
-                decisions.append({"kind": "decay", "cohort": cid, "dim": d, "arm": a, "promoted_rr": win["rr"],
-                                  "recent_rr": r["rr"], "p_recent_below_control": r["p_lt_ref"],
-                                  "drop_z": round(drop_z, 2)})
-                cstate["winner"] = None
-                cstate.setdefault("decayed", []).append({"arm": a, "minute": now, "recent_rr": r["rr"]})
-                use = summ_r
-        decayed = {x["arm"] for x in cstate.get("decayed", [])}
-        if decayed:
-            use = summ_r   # once novelty decay was seen here, allocate on the recent (discounted) evidence
         # ---- first exposure: small exploration shares sized by the risk budget
         if len(never_run) == len(arms) - 1:
             k = len(never_run)

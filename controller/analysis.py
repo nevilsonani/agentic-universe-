@@ -40,12 +40,15 @@ class EngagementModel:
                  ref: dict[str, str]):
         self.s, self.fs, self.eng, self.options, self.ref = s, fs, eng, options, ref
 
-    def _rows(self, now_day: int, half_life: float | None, since_day: int | None = None):
+    def _rows(self, now_day: int, half_life: float | None, since_day: int | None = None,
+              until_day: int | None = None):
         e = self.eng
         if e.n == 0:
             return None
         day = e.col("day") - DAY_OFF
         m = day >= (since_day if since_day is not None else -10 ** 6)
+        if until_day is not None:
+            m &= day < until_day
         w = np.ones(e.n)
         if half_life:
             w = 0.5 ** (np.maximum(now_day - day, 0) / half_life)
@@ -56,8 +59,8 @@ class EngagementModel:
         return cols
 
     def fit(self, now_day: int, half_life: float | None = None, since_day: int | None = None,
-            segments: bool = True) -> dict[str, DimFit]:
-        rows = self._rows(now_day, half_life, since_day)
+            segments: bool = True, until_day: int | None = None) -> dict[str, DimFit]:
+        rows = self._rows(now_day, half_life, since_day, until_day)
         out = {}
         for dim, col in (("welcome_message", "wm"), ("voice", "voice")):
             arms = self.options[dim]
@@ -115,9 +118,11 @@ class EngagementModel:
                 th = np.array([ests[v][0][a] for v in ests])
                 se = np.sqrt(np.array([ests[v][1][a] for v in ests]))
                 h = heterogeneity(th, se)
+                # `sig` (Bonferroni) gates what we *claim* (segment winners in the audit); allocation uses
+                # partial pooling (DerSimonian-Laird) without a hard gate — shrinkage is the multiplicity control.
                 sig = h["p"] < alpha and h["tau2"] > 0
                 df.het[f][df.arms[a]] = {"p": h["p"], "q": h["q"], "df": h["df"], "tau2": h["tau2"], "sig": bool(sig)}
-                if not sig:
+                if h["tau2"] <= 0:
                     continue
                 for v, (b, vv, _) in ests.items():
                     if not np.isfinite(vv[a]):
