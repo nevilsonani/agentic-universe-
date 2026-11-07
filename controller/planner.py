@@ -300,9 +300,17 @@ class Planner:
     def did_facet(self, wf: WorkflowInfo, st: dict, now: int, cur_cfg: dict) -> Facet | None:
         dids = wf.options["caller_id"]
         ds = st["did"]
+        cur0 = norm(dist(cur_cfg, "default", "caller_id"))
         healthy = [d for d in dids if ds[d]["state"] == "healthy"]
         canary = [d for d in dids if ds[d]["state"] in ("canary", "untested")]
         bad = [d for d in dids if ds[d]["state"] == "quarantined"]
+        # a "canary" that already carries a full share (e.g. from a single-DID spread) and shows no sign of
+        # trouble keeps it: cutting it back would only pile load onto the others.
+        for d in list(canary):
+            r = (ds[d].get("last") or {}).get("ratio")
+            if cur0.get(d, 0) > self.s.did_canary_share + 0.02 and (r is None or r >= self.s.did_graduate_ratio):
+                canary.remove(d)
+                healthy.append(d)
         if not healthy and not canary:
             return None
         if len(healthy) <= 1:
@@ -521,6 +529,29 @@ class Planner:
                       predicted={"eng_rel_mean": mean, "eng_p_harm": p_harm,
                                  "eng_q05": float(np.quantile(delta, 0.05)), "eng_q95": float(np.quantile(delta, 0.95))})
         return facet, snap
+
+    def decay_aware_draws(self, wf: WorkflowInfo, st: dict, now: int, tups: np.ndarray, S: int,
+                          rng: np.random.Generator) -> dict[str, np.ndarray]:
+        """The same posterior the planner allocates on: cumulative evidence, except arms flagged as decayed,
+        which are judged on recent evidence only. Used to re-check an approved change before applying it,
+        so the planner and the pre-apply check can never disagree about what the data says."""
+        now_day = now // 1440
+        model = EngagementModel(self.s, self.fs, self.ing.t(wf.id)["eng"], wf.options, st["ref"])
+        fit = model.fit(now_day)
+        decayed_any = any(st.get("decay", {}).get(d) for d in VARIANT_DIMS)
+        recent = model.fit(now_day, since_day=now_day - self.s.decay_window_days, segments=False) \
+            if decayed_any else None
+        out = {}
+        for d in VARIANT_DIMS:
+            draws = self._tup_draws(fit[d], tups, S, rng)
+            dec = st.get("decay", {}).get(d) or {}
+            if dec:
+                r = self._tup_draws(recent[d], tups, S, rng)
+                for a in dec:
+                    ai = fit[d].arms.index(a)
+                    draws[:, :, ai] = r[:, :, ai]
+            out[d] = draws
+        return out
 
     def _tup_draws(self, f, tups, S, rng) -> np.ndarray:
         """Posterior draws of each tuple's RR per arm: (S, T, A)."""

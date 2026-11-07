@@ -161,6 +161,15 @@ class Controller:
                                 b.get("approval_id"), config=cfg)
         new = self.reg.config(wf, v)
         dims = b.get("changed_dims") or []
+        if prev and new:
+            # the platform compares floats exactly, so re-normalisation noise can list dims nobody touched;
+            # we decide what was really changed with a tolerance (registry.changed_dims)
+            real = changed_dims(prev, new)
+            if set(real) != set(dims):
+                self.store.decide(minute, wf, "changed_dims_reconciled",
+                                  f"v{v}: platform listed {dims}, materially changed {real}",
+                                  {"platform": dims, "material": real})
+            dims = real
         if "prompt_version" in dims and new:
             self.inc.prompt_changed(wf, minute, new["prompt_version"])
         if actor != "supervisor":
@@ -347,6 +356,16 @@ class Controller:
                 st["snapshot_minute"] = now
             with self.store.tx():
                 self.store.save_wf_state(wf, st)
+                if snap and snap.get("dims"):
+                    # what the controller believed at this moment — the audit trail for "why not earlier?"
+                    parts = []
+                    for d, x in snap["dims"].items():
+                        parts.append(f"{d[:5]}: " + ", ".join(
+                            f"{a} {rr:.3f}±{sd:.3f}" for a, rr, sd in zip(x["arms"], x["global_rr"], x["global_sd"])))
+                    self.store.decide(now, wf, "analysis", " | ".join(parts),
+                                      {"dims": snap["dims"], "decay": snap.get("decay"),
+                                       "skipped": snap.get("skipped"),
+                                       "decayed": st.get("decay")})
             if facets:
                 self._route(w, now, facets, st)
             self._wall.setdefault("plan_s", 0.0)
@@ -503,13 +522,10 @@ class Controller:
         cfg = self.reg.config(row["wf"])
         new = row["body"]["proposed_config"]
         tups, cnt = self.planner.population(w, now)
-        from .analysis import EngagementModel
-        model = EngagementModel(self.s, self.fs, self.ing.t(row["wf"])["eng"], w.options, st["ref"])
-        fit = model.fit(now // MIN_PER_DAY)
         rng = np.random.default_rng(7)
-        draws = {d: self.planner._tup_draws(fit[d], tups, 2000, rng) for d in VARIANT_DIMS}
+        draws = self.planner.decay_aware_draws(w, st, now, tups, 2000, rng)
         _, p_harm, mean = self.planner.engagement_delta(w, cfg, new, config_cohorts(new), tups, cnt, draws)
-        if p_harm > 0.5:
+        if p_harm > 0.5 and mean < 0:
             return False, f"fresh data: P(engagement −1%) = {p_harm:.0%} (mean {mean:+.1%}); letting it lapse"
         return True, "ok"
 

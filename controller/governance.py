@@ -52,23 +52,49 @@ def clean_json(o):
     return o
 
 
-def canon_config(cfg: dict) -> dict:
-    """Allocation weights as integers (percent, or 1/10000) whenever they sit on that grid.
+def platform_norm(w: dict) -> dict:
+    """Exactly what the platform does to a weight map (docs §3: weights are normalised)."""
+    s = float(sum(w.values()))
+    return {o: float(x) / s for o, x in w.items() if x > 0}
 
-    The platform re-normalises what we send and compares distributions with exact float
-    equality. Re-normalising an already-normalised dict whose float sum is 1.0000000000000002
-    flips the last bit, which makes an untouched dimension look "changed" (and auto-apply then
-    refuses it). Integers on a fixed grid round-trip exactly: 78/100 is the same double every time.
+
+def canon_config(cfg: dict, stored: dict | None = None) -> dict:
+    """Choose, per distribution, a representation the platform will normalise to the intended floats.
+
+    The platform re-normalises what we send and compares distributions with *exact* float equality.
+    Re-normalising an already-normalised map whose float sum is 1.0000000000000002 flips the last bit,
+    so an untouched dimension can look "changed" (auto-apply then refuses it, and the change log lies).
+      * untouched distributions (equal, within 1e-9, to what the platform has stored): send whichever of
+        {stored floats verbatim, integer percent, integer 1/10000} normalises back to the stored floats
+        bit-for-bit — verified here by emulating the platform's normalisation;
+      * changed distributions: integer percent (or 1/10000) — 78/100 is the same double every time.
     """
     import copy
     out = copy.deepcopy(cfg)
+
+    def stored_dist(cid, d):
+        if not stored:
+            return None
+        return ((stored.get("allocations") or {}).get(cid) or {}).get(d)
+
     for cid, dims in (out.get("allocations") or {}).items():
         for d, w in list(dims.items()):
+            cands = []
             for unit in (100, 10000):
                 ints = {k: round(v * unit) for k, v in w.items()}
                 if all(abs(v * unit - ints[k]) < 1e-6 for k, v in w.items()) and sum(ints.values()) == unit:
-                    dims[d] = {k: int(v) for k, v in ints.items() if v > 0}
-                    break
+                    cands.append({k: int(v) for k, v in ints.items() if v > 0})
+            sd = stored_dist(cid, d)
+            if sd is not None and set(platform_norm(w)) == set(sd) and \
+                    all(abs(platform_norm(w)[k] - sd[k]) < 1e-9 for k in sd):
+                for c in [dict(sd)] + cands:
+                    if platform_norm(c) == sd:
+                        dims[d] = c
+                        break
+                else:
+                    dims[d] = dict(sd)
+            elif cands:
+                dims[d] = cands[0]
     return out
 
 
@@ -237,7 +263,7 @@ class Governance:
         return clean_json(self._raw_body(pid, d))
 
     def _raw_body(self, pid: str, d: Draft) -> dict:
-        d.proposed_config = canon_config(d.proposed_config)
+        d.proposed_config = canon_config(d.proposed_config, self.reg.config(d.wf, d.base_version))
         if d.channel == "auto":
             return {"proposal_id": pid, "base_version": d.base_version, "proposed_config": d.proposed_config,
                     "rationale": f"{d.change_summary}. {d.rationale}", "evidence": d.evidence}
