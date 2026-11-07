@@ -118,11 +118,12 @@ class EngagementModel:
                 th = np.array([ests[v][0][a] for v in ests])
                 se = np.sqrt(np.array([ests[v][1][a] for v in ests]))
                 h = heterogeneity(th, se)
-                # `sig` (Bonferroni) gates what we *claim* (segment winners in the audit); allocation uses
-                # partial pooling (DerSimonian-Laird) without a hard gate — shrinkage is the multiplicity control.
+                # `sig` (Bonferroni) gates what we *claim* (segment winners in the audit). Allocation uses
+                # DerSimonian-Laird partial pooling once Cochran's Q clears a moderate gate (p < het_alloc_p):
+                # no gate let noise invent segment effects; Bonferroni never let real ones through in time.
                 sig = h["p"] < alpha and h["tau2"] > 0
                 df.het[f][df.arms[a]] = {"p": h["p"], "q": h["q"], "df": h["df"], "tau2": h["tau2"], "sig": bool(sig)}
-                if h["tau2"] <= 0:
+                if h["tau2"] <= 0 or h["p"] >= self.s.het_alloc_p:
                     continue
                 for v, (b, vv, _) in ests.items():
                     if not np.isfinite(vv[a]):
@@ -286,6 +287,12 @@ def did_health(pdid: CellTable, n_did: int, now_minute: int, window_h: int, excl
     np.add.at(C, (sinv, dd), conn)
     out = {}
     peers_mask = np.array([i not in exclude for i in range(n_did)] + [False])
+    # recent load per DID (dials, exponentially weighted with a 1-day half-life over the last 3 days):
+    # reputation falls with call velocity, so an overloaded number under-performing is not a spam flag
+    lm = abs_hour >= now_h - 72
+    wts = 0.5 ** ((now_h - abs_hour[lm]) / 24.0)
+    load = np.bincount(np.minimum(pdid.col("did")[lm], n_did), weights=pdid.col("dials")[lm] * wts,
+                       minlength=n_did + 1)
     for i in range(n_did):
         n1, a = D[:, i], C[:, i]
         pm = peers_mask.copy()
@@ -298,6 +305,8 @@ def did_health(pdid: CellTable, n_did: int, now_minute: int, window_h: int, excl
         se = math.sqrt(var) if np.isfinite(var) else float("inf")
         peer_rate = b.sum() / max(n0.sum(), 1)
         out[i] = {"ratio": math.exp(lr), "lo": math.exp(lr - z * se) if np.isfinite(se) else 0.0,
+                  "load": float(load[i]), "peer_load": float(np.median([load[j] for j in range(n_did)
+                                                                        if j != i and peers_mask[j]] or [0.0])),
                   "hi": math.exp(lr + z * se) if np.isfinite(se) else float("inf"),
                   "dials": tot_d, "conn": float(a.sum()), "rate": float(a.sum() / tot_d),
                   "expected_conn": float(tot_d * peer_rate), "peer_rate": float(peer_rate)}

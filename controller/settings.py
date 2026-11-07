@@ -25,6 +25,9 @@ class Settings:
     # ---------------------------------------------------------------- experiment / learning
     prior_sd: float = 0.07            # skeptical prior on an arm's log-RR vs control (most variants are within ±15%)
     explore_risk_quantile: float = 0.25  # P(change is worse than -1%) we accept for a pure exploration step
+    explore_risk_quantile_guardrail: float = 0.10  # ...when engagement is the workflow's *guardrail* (KYC)
+    ts_gamma: float = 2.0             # share ∝ P(best)^γ — sharper than probability matching
+    min_calls_between_variant_changes: int = 300  # dwell: connected calls under the latest mix first
     harm_threshold: float = -0.01     # "harmful" = expected engagement drop of more than 1% (relative)
     max_harm_prob: float = 0.10       # exploitation changes: P(delta < harm_threshold) must stay below this
     explore_share_max: float = 0.15   # per-arm share cap for the very first exploration step
@@ -40,7 +43,8 @@ class Settings:
     winner_max_sd: float = 0.06       # ...and the posterior must be tight enough to act on
     loser_p: float = 0.95             # drop an arm when P(worse than control) >= this
     loser_max_rr: float = 0.98
-    het_alpha: float = 0.05           # heterogeneity (segment-specific effect) test, Bonferroni-divided
+    het_alpha: float = 0.05           # segment-specific *claims* in the audit: Bonferroni-divided
+    het_alloc_p: float = 0.01         # segment deviations used for allocation only if Cochran's Q p < this
     recent_half_life_days: float = 1.0   # time-discounted estimate used for decay detection
     decay_window_days: int = 1        # 'recent' = today + yesterday (24–48h); 'earlier' = everything before
     decay_drop_z: float = 1.0         # an arm holding ≥ decay_min_share is demoted when recent effect is this many
@@ -70,6 +74,7 @@ class Settings:
     did_min_expected_conn: float = 30.0   # long window: enough evidence to call a canary / quarantine
     did_short_ratio: float = 0.60         # short window only catches a collapse (spam flag), not drift
     did_short_min_expected_conn: float = 25.0
+    did_max_load_ratio: float = 1.5      # never quarantine a DID that is simply carrying more load than peers
     did_ci_z: float = 1.645
 
     # ---------------------------------------------------------------- hallucination

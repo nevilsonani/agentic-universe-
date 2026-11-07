@@ -307,7 +307,8 @@ class Planner:
         # a "canary" that already carries a full share (e.g. from a single-DID spread) and shows no sign of
         # trouble keeps it: cutting it back would only pile load onto the others.
         for d in list(canary):
-            r = (ds[d].get("last") or {}).get("ratio")
+            last = ds[d].get("last") or {}
+            r = last.get("ratio") if last.get("expected_conn", 0) >= self.s.did_min_expected_conn else None
             if cur0.get(d, 0) > self.s.did_canary_share + 0.02 and (r is None or r >= self.s.did_graduate_ratio):
                 canary.remove(d)
                 healthy.append(d)
@@ -365,7 +366,11 @@ class Planner:
             bar = self.s.did_short_ratio if short else self.s.did_quarantine_ratio
             enough = r["expected_conn"] >= need
             state = ds[d]["state"]
-            if enough and r["hi"] < bar and state != "quarantined":
+            overloaded = r.get("peer_load", 0) > 0 and r["load"] > self.s.did_max_load_ratio * r["peer_load"]
+            if enough and r["hi"] < bar and state != "quarantined" and overloaded:
+                ds[d]["note"] = (f"under-performing ({r['ratio']:.2f}× peers) but carrying {r['load'] / r['peer_load']:.1f}× "
+                                 f"their recent load — treated as load, not a flag; the even spread fixes it")
+            if enough and r["hi"] < bar and state != "quarantined" and not overloaded:
                 ds[d].update(state="quarantined", since=now, reason=f"pickup {r['ratio']:.2f}× peers "
                              f"(90% CI {r['lo']:.2f}–{r['hi']:.2f}, {r['dials']:.0f} dials, last {win}h)")
                 out.append({"did": d, "from": state, "to": "quarantined", "window_h": win, **r})
@@ -385,6 +390,7 @@ class Planner:
         now_day = now // 1440
         ref = st["ref"]
         eng = self.ing.t(wf.id)["eng"]
+        self._guardrail_mode = wf.primary != "engagement_rate"
         model = EngagementModel(s, self.fs, eng, wf.options, ref)
         fit = model.fit(now_day, half_life=None)
         split = now_day - s.decay_window_days
@@ -478,7 +484,7 @@ class Planner:
         delta, p_harm, mean = self.engagement_delta(wf, base_cfg, new_cfg, cohorts, tups, conn_w, tup_draws)
         explores_new = any(fit[d].n[fit[d].arms.index(a)] == 0
                            for cid, dd in targets.items() for d, dist_ in dd.items() for a in dist_ if a)
-        limit = s.explore_risk_quantile if explores_new else s.max_harm_prob
+        limit = (s.explore_risk_quantile_guardrail if self._guardrail_mode else s.explore_risk_quantile)             if explores_new else s.max_harm_prob
         lam_used = 1.0
         if p_harm > limit or (not explores_new and mean < s.min_expected_gain and not bootstrap
                               and not any(x["kind"] in ("loser", "decay") for x in decisions)):
@@ -501,6 +507,15 @@ class Planner:
             for d, t in dd.items():
                 max_tv = max(max_tv, tv(dist(base_cfg, src, d), t))
         structural = any(x["kind"] in ("loser", "decay", "winner") for x in decisions)
+        # dwell: let the latest mix collect evidence before spending another change on it
+        last_v = max([v for v, m in self.reg.version_meta.get(wf.id, {}).items()
+                      if set(m.get("changed_dims") or []) & {"welcome_message", "voice", "cohorts"}] or [0])
+        since = int(eng.col("conn")[eng.col("ver") >= last_v].sum()) if last_v and eng.n else 10 ** 9
+        snap["dwell"] = {"since_version": last_v, "connected_since": since}
+        if not bootstrap and not structural and since < s.min_calls_between_variant_changes:
+            snap["skipped"] = {"reason": f"dwell: {since} connected calls under v{last_v} "
+                                         f"(< {s.min_calls_between_variant_changes})"}
+            return None, snap
         if max_tv < 1e-9 or (max_tv < s.min_realloc_tv and not structural and not bootstrap):
             snap["skipped"] = {"reason": f"largest reallocation {max_tv:.2f} < {s.min_realloc_tv}", "mean": mean}
             return None, snap
@@ -586,18 +601,25 @@ class Planner:
             cstate.setdefault("history", []).append({**cstate["winner"], "ended": now, "why": "decay"})
             cstate["winner"] = None
         use = summ
+        # ---- allocated but not yet observed (campaign-locked workflows lag by up to a day): wait for data,
+        # never "re-explore" an arm that is already live — that double-counts exposure and wastes an approval
+        awaiting = [a for a in never_run if cur.get(a, 0) > 0]
+        if awaiting:
+            decisions.append({"kind": "awaiting_data", "cohort": cid, "dim": d, "arms": awaiting})
+            return dict(cur), f"waiting for first calls on {', '.join(awaiting)}"
         # ---- first exposure: small exploration shares sized by the risk budget
         if len(never_run) == len(arms) - 1:
             k = len(never_run)
-            s0 = self._explore_share(k_total=k)
+            s0 = self._explore_share(k_total=k, guardrail=self._guardrail_mode)
             tgt = {a: s0 for a in never_run}
             rest = 1 - s0 * k
             for a, w in cur.items():
                 tgt[a] = tgt.get(a, 0) + rest * w
             decisions.append({"kind": "explore", "cohort": cid, "dim": d, "arms": never_run, "share": s0})
             return round_dist(tgt, 0.01), f"explore untested arms at {s0:.0%} each"
-        # ---- Thompson target with guard rails
-        pb = {a: use[a]["p_best"] for a in arms}
+        # ---- Thompson target with guard rails. share ∝ P(best)^γ (γ=2): with few, scarce governance
+        # changes, plain probability matching leaves too much traffic on arms that are probably worse.
+        pb = {a: use[a]["p_best"] ** self.s.ts_gamma for a in arms}
         losers = {a for a in arms if a != ref and use[a]["p_lt_ref"] >= s.loser_p and use[a]["rr"] <= s.loser_max_rr
                   and (use[a]["sd_log"] <= s.loser_max_sd or a in decayed)}
         for a in losers:
@@ -635,13 +657,14 @@ class Planner:
         why = ", ".join(f"{a}:{tgt.get(a, 0):.0%} (P(best) {pb[a]:.2f}, RR {use[a]['rr']:.3f})" for a in arms)
         return tgt, why
 
-    def _explore_share(self, k_total: int) -> float:
+    def _explore_share(self, k_total: int, guardrail: bool = False) -> float:
         """Largest per-arm share whose prior-predictive P(Δ < −1%) stays within the exploration budget,
-        assuming both dims explore at once (5 arms in a typical workflow)."""
+        assuming both dims explore at once (5 arms in a typical workflow). Tighter when engagement is the
+        guardrail rather than the target (pickup-primary workflows)."""
         s = self.s
         from .stats import norm_ppf
         k = max(k_total * 2, 1)       # welcome and voice explored together → roughly double the arms
-        z = -norm_ppf(s.explore_risk_quantile)
+        z = -norm_ppf(s.explore_risk_quantile_guardrail if guardrail else s.explore_risk_quantile)
         share = -s.harm_threshold / (z * s.prior_sd * math.sqrt(k)) if z > 0 else s.explore_share_max
         return float(np.clip(round(share, 2), s.explore_share_min, s.explore_share_max))
 
