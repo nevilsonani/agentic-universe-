@@ -5,6 +5,8 @@
   python -m controller heard  --db runs/ctl/state.db --person ks_cancel:p0001234 [--day 3]
   python -m controller view   --db runs/ctl/state.db [--out supervisor.html] [--serve 8800]
   python -m controller health --db runs/ctl/state.db          # loop health + open alerts, for on-call
+  python -m controller pause  --db runs/ctl/state.db --workflow ks_cancel --hours 12 --reason "client escalation"
+  python -m controller digest --db runs/ctl/state.db --tenant northwind_life --since D0 --until D7   # weekly summary
 """
 from __future__ import annotations
 
@@ -39,6 +41,19 @@ def main(argv=None):
     v.add_argument("--serve", type=int, default=None)
     he = sub.add_parser("health")
     he.add_argument("--db", required=True)
+    pa = sub.add_parser("pause", help="stop routine changes on one workflow (safety fixes still flow)")
+    pa.add_argument("--db", required=True)
+    pa.add_argument("--workflow", required=True)
+    pa.add_argument("--hours", type=float, default=24)
+    pa.add_argument("--reason", required=True)
+    re_ = sub.add_parser("resume")
+    re_.add_argument("--db", required=True)
+    re_.add_argument("--workflow", required=True)
+    dg = sub.add_parser("digest")
+    dg.add_argument("--db", required=True)
+    dg.add_argument("--tenant", default=None)
+    dg.add_argument("--since", default="D0")
+    dg.add_argument("--until", default=None)
     a = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if getattr(a, "verbose", False) else logging.INFO,
@@ -68,6 +83,21 @@ def main(argv=None):
     elif a.cmd == "health":
         from .audit import health
         print(health(a.db))
+    elif a.cmd in ("pause", "resume"):
+        from .store import Store
+        st = Store(a.db)
+        now = st.meta("cursor_until_minute") or 0
+        with st.tx():
+            if a.cmd == "pause":
+                st.set_meta(f"pause:{a.workflow}", {"until": now + int(a.hours * 60), "reason": a.reason})
+                st.decide(now, a.workflow, "operator_pause", f"paused for {a.hours}h: {a.reason}")
+            else:
+                st.set_meta(f"pause:{a.workflow}", None)
+                st.decide(now, a.workflow, "operator_resume", "resumed")
+        print(f"{a.cmd}d {a.workflow}")
+    elif a.cmd == "digest":
+        from .audit import digest
+        print(digest(a.db, a.tenant, a.since, a.until))
 
 
 if __name__ == "__main__":

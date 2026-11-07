@@ -180,3 +180,51 @@ def health(path: str) -> str:
     L += [f"  {p['proposal_id']} {p['status']} since {label(p['created_minute'])}: {p['summary'][:100]}" for p in pr] \
         or ["  none"]
     return "\n".join(L)
+
+
+def digest(path: str, tenant: str | None = None, since: str = "D0", until: str | None = None) -> str:
+    """Weekly summary for a client (Compliance asked for it): every change, who made it and why, with the
+    operational auto-applies we made under the signed policy called out separately; approvals; incidents."""
+    db = _db(path)
+    t0 = parse_label(since)
+    t1 = parse_label(until) if until else 10 ** 9
+    wfs = [r for r in db.execute("SELECT wf, tenant, info FROM workflows ORDER BY idx")
+           if tenant is None or r["tenant"] == tenant]
+    L = [f"# Weekly summary{' — ' + tenant if tenant else ''} ({label(t0)} → {label(min(t1, 10 ** 8)) if until else 'now'})", ""]
+    for w in wfs:
+        wf = w["wf"]
+        L += [f"## {wf}", ""]
+        rows = db.execute("SELECT version, actor, minute, changed_dims, proposal_id, approval_id FROM config_versions "
+                          "WHERE wf=? AND minute>=? AND minute<? ORDER BY minute", (wf, t0, t1)).fetchall()
+        ops = [r for r in rows if r["actor"] == "controller_auto"]
+        appr = [r for r in rows if r["actor"] == "controller_approved"]
+        sup = [r for r in rows if r["actor"] == "supervisor"]
+
+        def line(r):
+            p = db.execute("SELECT summary FROM proposals WHERE proposal_id=?", (r["proposal_id"],)).fetchone() \
+                if r["proposal_id"] else None
+            return (f"- {label(r['minute'])} v{r['version']} ({', '.join(json.loads(r['changed_dims'] or '[]'))})"
+                    + (f" via {r['approval_id']}" if r["approval_id"] else "") + (f": {p['summary']}" if p else ""))
+        L += [f"**Approved by your approvers ({len(appr)})**", ""] + ([line(r) for r in appr] or ["- none"]) + [""]
+        L += [f"**Applied by us under the auto-apply policy you signed ({len(ops)})** — operational settings only "
+              f"(caller-ID rotation, call timing{', and within max_shift, welcome/voice' if any('voice' in (r['changed_dims'] or '') or 'welcome' in (r['changed_dims'] or '') for r in ops) else ''})",
+              ""] + ([line(r) for r in ops] or ["- none"]) + [""]
+        L += [f"**Your own edits ({len(sup)})** — never overwritten silently", ""] + \
+             ([f"- {label(r['minute'])} v{r['version']} ({', '.join(json.loads(r['changed_dims'] or '[]'))})" for r in sup]
+              or ["- none"]) + [""]
+        st = {r["status"]: r["n"] for r in db.execute(
+            "SELECT status, COUNT(*) n FROM proposals WHERE wf=? AND channel='approval' AND created_minute>=? "
+            "AND created_minute<? GROUP BY status", (wf, t0, t1))}
+        L += [f"Approval requests: {sum(st.values())} ({', '.join(f'{k} {v}' for k, v in st.items()) or 'none'})"]
+        inc = db.execute("SELECT id, type, status, opened_minute, resolved_minute FROM incidents WHERE wf=? AND "
+                         "opened_minute>=? AND opened_minute<?", (wf, t0, t1)).fetchall()
+        L += [f"Incidents: " + ("; ".join(f"{i['id']} {i['type']} opened {label(i['opened_minute'])}, {i['status']}"
+                                          + (f" {label(i['resolved_minute'])}" if i['resolved_minute'] is not None else "")
+                                          for i in inc) or "none")]
+        val = db.execute("SELECT run_id, prompt, n, pass_rate FROM validations WHERE wf=? AND minute>=? AND minute<?",
+                         (wf, t0, t1)).fetchall()
+        if val:
+            L += ["Validation evidence: " + "; ".join(f"{v['run_id']} {v['prompt']} pass {v['pass_rate']:.3f} (n={v['n']})"
+                                                      for v in val)]
+        L.append("")
+    return "\n".join(L)

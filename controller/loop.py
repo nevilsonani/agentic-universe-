@@ -384,6 +384,12 @@ class Controller:
     # ================================================================== routing
     def _route(self, w, now: int, facets: list[Facet], st: dict):
         wf = w.id
+        pause = self.store.meta(f"pause:{wf}")
+        if pause and pause.get("until", 0) > now:
+            # an operator paused this workflow (python -m controller pause): only safety fixes go through
+            facets = [f for f in facets if f.urgency == "safety"]
+            if not facets:
+                return
         cfg = self.reg.config(wf)
         auto_dims = w.auto_dims()
         pref = self.gov.pref(wf)

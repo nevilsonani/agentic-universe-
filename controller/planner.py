@@ -242,9 +242,15 @@ class Planner:
         if not weights:
             return None
         # dry run: re-weight each hour's historical dial mix by the new weights, same capacity per hour
-        gain = self._schedule_gain(wf, pickup, cohorts, weights, tups, cnt)
         old_hw = (base_cfg.get("schedule") or {}).get("hour_weights") or {}
-        if old_hw == weights or gain["rel_gain"] < self.s.schedule_min_gain:
+        # material change? (a refresh that moves no weight by more than 15% is not worth a change, let alone
+        # an approval on a workflow without auto-apply)
+        if old_hw and set(old_hw) == set(weights) and all(
+                abs(float(weights[c][h]) / max(float(old_hw[c].get(h, 1.0)), 1e-6) - 1) < 0.15
+                for c in weights for h in weights[c]):
+            return None
+        gain = self._schedule_gain(wf, pickup, cohorts, weights, tups, cnt, old_hw)
+        if gain["rel_gain"] < self.s.schedule_min_gain:
             return None
         used = ", ".join(pickup.features_used())
         return Facet("schedule", {"schedule"}, "routine",
@@ -259,7 +265,7 @@ class Planner:
                      evidence={"feature_tests": pickup.tests, "relative_pickup_by_hour": profiles, "hours": hours},
                      predicted={"pickup_rel_gain": gain["rel_gain"], "dry_run": gain})
 
-    def _schedule_gain(self, wf, pickup, cohorts, weights, tups, cnt) -> dict:
+    def _schedule_gain(self, wf, pickup, cohorts, weights, tups, cnt, old_hw=None) -> dict:
         pt = self.ing.t(wf.id)["ptime"]
         day = pt.col("day") - DAY_OFF
         hour = pt.col("hour")
@@ -281,7 +287,10 @@ class Planner:
             cap = sum(x_old.values())
             if cap == 0:
                 continue
-            ws = {cid: x * weights.get(cid, {}).get(str(h), 1.0) for cid, x in x_old.items()}
+            # counterfactual relative to what is live: the recent dial mix already reflects the current weights
+            ws = {cid: x * weights.get(cid, {}).get(str(h), 1.0) /
+                  max(float(((old_hw or {}).get(cid) or (old_hw or {}).get("default") or {}).get(str(h), 1.0)), 1e-6)
+                  for cid, x in x_old.items()}
             sw = sum(ws.values()) or 1.0
             for c in cohorts:
                 m = c.mask(self.fs, tups)
@@ -292,8 +301,8 @@ class Planner:
                 new += cap * ws[c.id] / sw * p
             tot += cap
         return {"rel_gain": (new / old - 1) if old else 0.0, "dials": float(tot),
-                "method": "reweight last-7-day dial mix per hour by new weights; capacity per hour fixed; pickup "
-                          "from the attempt-adjusted hour model",
+                "method": "reweight last-7-day dial mix per hour by new/current weight; capacity per hour fixed; "
+                          "pickup from the attempt-adjusted hour model",
                 "assumption": "eligible pool in each hour looks like the historical dialled mix"}
 
     # ------------------------------------------------------------------ caller ID (C5)
